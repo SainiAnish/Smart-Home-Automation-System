@@ -1,0 +1,285 @@
+/*******************************************************
+ * Smart Home Automation – ESP8266 (NodeMCU) + Blynk 2.0
+ * Features: Relays (Light1, Light2, Fan, Pump, Siren),
+ * DHT22, PIR, MQ-2 Gas (A0), Flame, Dual Water Leak,
+ * Servo Door Lock, Automation Rules, Alerts via Events.
+ *
+ * Fill your Blynk Template/Token and WiFi below.
+ *******************************************************/
+
+#define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"
+#define BLYNK_DEVICE_NAME   "SmartHome"
+#define BLYNK_AUTH_TOKEN    "YOUR_AUTH_TOKEN"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <DHT.h>
+#include <Servo.h>              // Use "ESP8266Servo" library if standard Servo misbehaves
+
+// ---------- WiFi ----------
+char ssid[] = "YourWiFiSSID";
+char pass[] = "YourWiFiPassword";
+
+// ---------- Sensors ----------
+#define DHTPIN   D2
+#define DHTTYPE  DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+#define PIR_PIN        D5       // Motion
+#define GAS_PIN        A0       // MQ-2 analog
+#define FLAME_PIN      D0       // Digital output (LOW/0 when flame detected on some modules – check yours!)
+#define LEAK_KITCHEN   D3       // Digital output 1/0 depending module
+#define LEAK_BATH      D4
+
+// ---------- Actuators ----------
+#define RELAY_LIGHT1   D6
+#define RELAY_LIGHT2   D7
+#define RELAY_FAN      D8
+#define RELAY_PUMP     D1
+#define RELAY_SIREN    D0   // If sharing with flame pin, move flame to D1 and pump elsewhere. Adjust wiring + pins!
+
+// ---------- Servo (Door Lock) ----------
+#define SERVO_PIN      SD3   // GPIO10 on many NodeMCU boards; if issues, try D5 and move PIR to D0/D1
+Servo doorServo;
+const int SERVO_LOCKED  = 20;   // servo angles – tune for your lock
+const int SERVO_UNLOCKED= 100;
+
+// ---------- Blynk Virtual Pins ----------
+#define VP_TEMP        V0
+#define VP_HUM         V1
+#define VP_MOTION      V2
+#define VP_GAS         V3
+#define VP_FLAME       V4
+#define VP_LEAK_K      V5
+#define VP_LEAK_B      V6
+
+#define VP_LIGHT1      V7
+#define VP_LIGHT2      V8
+#define VP_FAN         V9
+#define VP_PUMP        V10
+#define VP_SIREN       V11
+#define VP_LOCK        V12
+
+#define VP_AUTO_MOTION V13
+#define VP_AUTO_FAN    V14
+#define VP_FAN_THRESH  V15
+#define VP_TIME_WINDOW V16
+#define VP_AUTO_SAFETY V17
+#define VP_STATUS      V18
+
+// ---------- Runtime State ----------
+BlynkTimer timer;
+
+// Automation flags and params
+bool enableAutoMotion = true;
+bool enableAutoFan    = true;
+bool enableAutoSafety = true;
+int  fanTempThreshold = 28; // °C
+
+// Motion + time window
+int windowStart = 21 * 60;  // default 21:00
+int windowEnd   = 6 * 60;   // default 06:00 (next day window supported)
+
+// Debounce / sampling
+unsigned long lastSample = 0;
+const unsigned long sampleMs = 1500;
+
+// Utilities
+bool isActiveLowRelay = true; // set to true for most relay boards
+
+// ---------- Helper Functions ----------
+void relayWrite(uint8_t pin, bool on) {
+  if (isActiveLowRelay) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+bool isWithinWindow(int minutesNow, int start, int end) {
+  // supports windows that cross midnight (e.g., 21:00 -> 06:00)
+  if (start <= end) return (minutesNow >= start && minutesNow < end);
+  return (minutesNow >= start || minutesNow < end);
+}
+
+// get minutes since midnight from Blynk's RTC
+int getMinutesNow() {
+  // Blynk 2.0: use device time (synchronized automatically)
+  time_t now = Blynk.getServerTime();  // seconds
+  if (now == 0) return 0;
+  struct tm *tmnow = localtime(&now);
+  return tmnow->tm_hour * 60 + tmnow->tm_min;
+}
+
+void pushStatus(const String& s) {
+  Blynk.virtualWrite(VP_STATUS, s);
+}
+
+// ---------- Blynk Handlers (Manual Controls) ----------
+BLYNK_WRITE(VP_LIGHT1) { relayWrite(RELAY_LIGHT1, param.asInt()); }
+BLYNK_WRITE(VP_LIGHT2) { relayWrite(RELAY_LIGHT2, param.asInt()); }
+BLYNK_WRITE(VP_FAN)    { relayWrite(RELAY_FAN,    param.asInt()); }
+BLYNK_WRITE(VP_PUMP)   { relayWrite(RELAY_PUMP,   param.asInt()); }
+BLYNK_WRITE(VP_SIREN)  { relayWrite(RELAY_SIREN,  param.asInt()); }
+
+BLYNK_WRITE(VP_LOCK) {
+  int v = param.asInt();
+  doorServo.write(v ? SERVO_UNLOCKED : SERVO_LOCKED);
+}
+
+BLYNK_WRITE(VP_AUTO_MOTION) { enableAutoMotion = param.asInt(); }
+BLYNK_WRITE(VP_AUTO_FAN)    { enableAutoFan    = param.asInt(); }
+BLYNK_WRITE(VP_AUTO_SAFETY) { enableAutoSafety = param.asInt(); }
+BLYNK_WRITE(VP_FAN_THRESH)  { fanTempThreshold = param.asInt(); }
+
+// TimeInput: returns start/stop minutes (0..1440)
+BLYNK_WRITE(VP_TIME_WINDOW) {
+  TimeInputParam t(param);
+  if (t.hasStartTime() && t.hasStopTime()) {
+    windowStart = t.getStartHour() * 60 + t.getStartMinute();
+    windowEnd   = t.getStopHour()  * 60 + t.getStopMinute();
+  }
+}
+
+// ---------- Sensor Reading & Logic ----------
+void sampleAndPublish() {
+  // DHT
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t) && !isnan(h)) {
+    Blynk.virtualWrite(VP_TEMP, t);
+    Blynk.virtualWrite(VP_HUM, h);
+  }
+
+  // PIR
+  int motion = digitalRead(PIR_PIN) == HIGH ? 1 : 0;
+  Blynk.virtualWrite(VP_MOTION, motion);
+
+  // GAS
+  int gasRaw = analogRead(GAS_PIN);        // 0..1023
+  Blynk.virtualWrite(VP_GAS, gasRaw);
+
+  // FLAME
+  int flame = digitalRead(FLAME_PIN);      // depends on module: often 0 = fire detected
+  int flameDetected = (flame == LOW) ? 1 : 0;
+  Blynk.virtualWrite(VP_FLAME, flameDetected);
+
+  // Water Leaks
+  int leakK = digitalRead(LEAK_KITCHEN);   // depends on module; invert if needed
+  int leakB = digitalRead(LEAK_BATH);
+  int leakKitchen = (leakK == LOW) ? 1 : 0;
+  int leakBath    = (leakB == LOW) ? 1 : 0;
+  Blynk.virtualWrite(VP_LEAK_K, leakKitchen);
+  Blynk.virtualWrite(VP_LEAK_B, leakBath);
+
+  // --------- AUTOMATIONS ---------
+  // Auto-Fan
+  if (enableAutoFan && !isnan(t)) {
+    bool shouldFan = (t >= fanTempThreshold);
+    relayWrite(RELAY_FAN, shouldFan);
+    Blynk.virtualWrite(VP_FAN, shouldFan);
+  }
+
+  // Motion-based Auto-Light within time window (night)
+  if (enableAutoMotion) {
+    int nowMin = getMinutesNow();
+    if (isWithinWindow(nowMin, windowStart, windowEnd)) {
+      static unsigned long lastMotionTime = 0;
+      const unsigned long holdMs = 60UL * 1000UL; // keep light on for 60s after last motion
+      if (motion) {
+        relayWrite(RELAY_LIGHT1, true);
+        Blynk.virtualWrite(VP_LIGHT1, 1);
+        lastMotionTime = millis();
+      } else {
+        if (millis() - lastMotionTime > holdMs) {
+          relayWrite(RELAY_LIGHT1, false);
+          Blynk.virtualWrite(VP_LIGHT1, 0);
+        }
+      }
+    }
+  }
+
+  // Safety automations + Alerts
+  if (enableAutoSafety) {
+    // Gas threshold – tune after calibration
+    const int GAS_THRESHOLD = 450;
+    if (gasRaw >= GAS_THRESHOLD) {
+      relayWrite(RELAY_SIREN, true);
+      Blynk.virtualWrite(VP_SIREN, 1);
+      Blynk.logEvent("gas_alert", String("High gas level: ") + gasRaw);
+      pushStatus("GAS ALERT triggered");
+    }
+    if (flameDetected) {
+      relayWrite(RELAY_SIREN, true);
+      Blynk.virtualWrite(VP_SIREN, 1);
+      Blynk.logEvent("flame_alert", "Flame detected!");
+      pushStatus("FLAME ALERT triggered");
+    }
+    if (leakKitchen || leakBath) {
+      // optional: auto-stop pump
+      relayWrite(RELAY_PUMP, false);
+      Blynk.virtualWrite(VP_PUMP, 0);
+      relayWrite(RELAY_SIREN, true);
+      Blynk.virtualWrite(VP_SIREN, 1);
+      String msg = "WATER LEAK: ";
+      if (leakKitchen) msg += "Kitchen ";
+      if (leakBath)    msg += "Bathroom";
+      Blynk.logEvent("leak_alert", msg);
+      pushStatus(msg);
+    }
+  }
+}
+
+// ---------- Sync app state on connect ----------
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(
+    VP_LIGHT1, VP_LIGHT2, VP_FAN, VP_PUMP, VP_SIREN,
+    VP_LOCK, VP_AUTO_MOTION, VP_AUTO_FAN, VP_FAN_THRESH,
+    VP_TIME_WINDOW, VP_AUTO_SAFETY
+  );
+  pushStatus("Device connected");
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+
+  // Pins
+  pinMode(PIR_PIN, INPUT);
+  pinMode(FLAME_PIN, INPUT_PULLUP);    // depends on module; adjust if active HIGH
+  pinMode(LEAK_KITCHEN, INPUT_PULLUP); // many leak modules pull LOW on detect
+  pinMode(LEAK_BATH, INPUT_PULLUP);
+
+  pinMode(RELAY_LIGHT1, OUTPUT);
+  pinMode(RELAY_LIGHT2, OUTPUT);
+  pinMode(RELAY_FAN,    OUTPUT);
+  pinMode(RELAY_PUMP,   OUTPUT);
+  pinMode(RELAY_SIREN,  OUTPUT);
+
+  // Safe OFF state
+  relayWrite(RELAY_LIGHT1, false);
+  relayWrite(RELAY_LIGHT2, false);
+  relayWrite(RELAY_FAN,    false);
+  relayWrite(RELAY_PUMP,   false);
+  relayWrite(RELAY_SIREN,  false);
+
+  // Servo
+  doorServo.attach(SERVO_PIN);
+  doorServo.write(SERVO_LOCKED);
+
+  dht.begin();
+
+  // Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // Timer: sample sensors & run logic every 1.5s
+  timer.setInterval(sampleMs, sampleAndPublish);
+
+  pushStatus("Booting complete");
+}
+
+// ---------- Loop ----------
+void loop() {
+  Blynk.run();
+  timer.run();
+}
