@@ -28,7 +28,7 @@ Servo Motor	Controls door lock position (locked/unlocked).
 
 Buzzer/Siren	Sounds alarm during fire, gas leak, or water leak.
 
-4. Implementation Steps
+3. Implementation Steps
 
 Hardware Setup :
 Connect sensors and actuators to ESP8266 GPIO pins.
@@ -63,7 +63,7 @@ Automatic siren and alert notifications for safety events.
 
 
 
-3. How It Works
+4. How It Works
 
 Sensing: DHT22, PIR, MQ-2, flame, and water leak sensors detect environmental changes.
 
